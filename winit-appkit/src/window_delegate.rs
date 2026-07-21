@@ -874,8 +874,21 @@ impl WindowDelegate {
 
     #[track_caller]
     pub(super) fn view(&self) -> Retained<WinitView> {
-        // The view inside WinitWindow should always be set and be `WinitView`.
-        self.window().contentView().unwrap().downcast().unwrap()
+        // The WinitView is normally the window's content view. But an app may wrap it in a
+        // backdrop view (e.g. an NSVisualEffectView for masked window vibrancy) and make THAT
+        // the content view, nesting the WinitView one level down. Handle both (cck fork patch).
+        let content = self.window().contentView().unwrap();
+        let content = match content.downcast::<WinitView>() {
+            Ok(view) => return view,
+            Err(content) => content,
+        };
+        let subviews = content.subviews();
+        for i in 0..subviews.count() {
+            if let Ok(view) = subviews.objectAtIndex(i).downcast::<WinitView>() {
+                return view;
+            }
+        }
+        panic!("WinitView should be the content view or one of its subviews")
     }
 
     #[track_caller]
