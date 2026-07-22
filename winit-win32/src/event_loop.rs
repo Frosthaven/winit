@@ -47,15 +47,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PM_REMOVE, PT_PEN, PT_TOUCH, PeekMessageW, PostMessageW,
     QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassExW, RegisterWindowMessageA,
     SC_MINIMIZE, SC_RESTORE, SIZE_MAXIMIZED, SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetWindowPos,
-    SystemParametersInfoW, TranslateMessage, WHEEL_DELTA, WINDOWPOS, WM_CAPTURECHANGED, WM_CLOSE,
+    KillTimer, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetTimer,
+    SetWindowPos, SystemParametersInfoW, TranslateMessage, WHEEL_DELTA, WINDOWPOS,
+    WM_CAPTURECHANGED, WM_CLOSE,
     WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO,
     WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
     WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MENUCHAR, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE,
     WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN,
     WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WM_TOUCH,
     WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WMSZ_BOTTOM,
     WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT,
     WMSZ_TOPRIGHT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -93,6 +95,13 @@ use crate::util::{WIN10_BUILD_VERSION, wrap_device_id};
 use crate::window::{InitData, Window};
 use crate::window_state::{CursorFlags, ImeState, WindowFlags, WindowState};
 use crate::{raw_input, util};
+
+// DRAGON-300: id + interval for the timer that pumps redraws during the modal move/resize
+// loop (see the `WM_ENTERSIZEMOVE` / `WM_TIMER` / `WM_EXITSIZEMOVE` handlers). The interval is
+// clamped up to the system timer resolution (~15 ms) by Windows, which is fine for tracking a
+// drag; iced coalesces every `SurfaceResized` since the last tick into one relayout + redraw.
+const MODAL_LOOP_PUMP_TIMER_ID: usize = 0x7150;
+const MODAL_LOOP_PUMP_INTERVAL_MS: u32 = 8;
 
 // This is defined in `winuser.h` as a macro that expands to `UINT_MAX`
 const WHEEL_PAGESCROLL: u32 = u32::MAX;
@@ -1110,6 +1119,31 @@ unsafe fn public_window_callback_inner(
             userdata
                 .window_state_lock()
                 .set_window_flags_in_place(|f| f.insert(WindowFlags::MARKER_IN_SIZE_MOVE));
+            // DRAGON-300: the interactive move/resize spins a modal `DefWindowProc` loop that
+            // starves our normal event pump, so a client (libcosmic/iced) never drains the
+            // `SurfaceResized` events we post until the drag ends — content only re-lays-out /
+            // rescales on release, unlike macOS live resize. A timer DOES tick inside that modal
+            // loop; arm one to pump the runner each frame (see the `WM_TIMER` arm below).
+            unsafe { SetTimer(window, MODAL_LOOP_PUMP_TIMER_ID, MODAL_LOOP_PUMP_INTERVAL_MS, None) };
+            result = ProcResult::Value(0);
+        },
+
+        // DRAGON-300: fires only while the modal move/resize loop is running (armed in
+        // `WM_ENTERSIZEMOVE`). Drive one wait/wake cycle so the app handler's `about_to_wait`
+        // runs INSIDE the modal loop — that is where a client (libcosmic/iced) drains the queued
+        // `SurfaceResized` events, re-lays-out, and requests the redraw the loop then paints
+        // (`request_redraw` posts an internal `WM_PAINT` the modal message pump services). Skip
+        // when the handler is already taken (`should_buffer`) — dispatching to it re-entrantly
+        // would panic.
+        WM_TIMER if wparam == MODAL_LOOP_PUMP_TIMER_ID => {
+            let in_size_move = userdata
+                .window_state_lock()
+                .window_flags()
+                .contains(WindowFlags::MARKER_IN_SIZE_MOVE);
+            if in_size_move && !userdata.event_loop_runner.should_buffer() {
+                userdata.event_loop_runner.prepare_wait();
+                userdata.event_loop_runner.wakeup();
+            }
             result = ProcResult::Value(0);
         },
 
@@ -1121,6 +1155,9 @@ unsafe fn public_window_callback_inner(
             }
 
             state.set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_IN_SIZE_MOVE));
+            drop(state);
+            // DRAGON-300: stop the modal-loop redraw pump armed in `WM_ENTERSIZEMOVE`.
+            unsafe { KillTimer(window, MODAL_LOOP_PUMP_TIMER_ID) };
             result = ProcResult::Value(0);
         },
 
