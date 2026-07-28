@@ -132,6 +132,15 @@ pub struct ViewState {
     /// to the application, even during IME
     forward_key_to_app: Cell<bool>,
 
+    /// True only while `interpretKeyEvents:` is running inside `keyDown:`.
+    ///
+    /// Used by `insertText:` to tell keyboard-driven text (which winit already
+    /// delivers as `KeyEvent` text) from OUT-OF-BAND insertions — the macOS
+    /// Character Viewer / emoji palette, dictation, Services — which arrive with
+    /// no `keyDown:` and no `setMarkedText:` and would otherwise be dropped
+    /// (rust-windowing/winit#3342).
+    in_key_event: Cell<bool>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
@@ -395,6 +404,22 @@ define_class!(
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
+            } else if !self.ivars().in_key_event.get()
+                && self.ivars().ime_capabilities.get().is_some()
+                && !is_control
+            {
+                // Out-of-band insertText: no `keyDown:`/`interpretKeyEvents:` is in
+                // flight, so this text did not come from the keyboard. AppKit delivers
+                // the Character Viewer (emoji/symbols) palette, dictation and Services
+                // this way — `insertText:` on the first responder with no preceding
+                // `setMarkedText:` — so `hasMarkedText()` is false and the branch above
+                // drops it (rust-windowing/winit#3342). Deliver it as a one-shot
+                // `Ime::Commit`, gated on the app having opted into IME
+                // (`ime_capabilities`) so stray insertText noise outside a text field
+                // can't fire. We deliberately do NOT set `ImeState::Committed`: unlike
+                // a real IME commit there is no following `keyDown:` to swallow, so the
+                // user's next keystroke must stay unaffected.
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
             }
         }
 
@@ -466,7 +491,9 @@ define_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_capabilities.get().is_some() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                self.ivars().in_key_event.set(true);
                 self.interpretKeyEvents(&events_for_nsview);
+                self.ivars().in_key_event.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -807,6 +834,7 @@ impl WinitView {
             input_source: Default::default(),
             ime_capabilities: Default::default(),
             forward_key_to_app: Default::default(),
+            in_key_event: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             option_as_alt: Cell::new(option_as_alt),
