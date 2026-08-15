@@ -410,6 +410,34 @@ impl WindowState {
         !(configure.is_maximized() || configure.is_fullscreen() || configure.is_tiled())
     }
 
+    /// Whether a CLIENT-initiated resize should be applied under `configure`.
+    ///
+    /// Deliberately weaker than [`Self::is_stateless`], and the two must not be merged.
+    /// `is_stateless` answers "does this configure describe the window's own floating
+    /// size", which is a question about BOOKKEEPING: a maximized, fullscreen or tiled
+    /// size must never overwrite the size the window returns to, so all three states
+    /// disqualify it there and that is correct.
+    ///
+    /// This answers a different question: "may the client choose its own size right
+    /// now". Maximized and fullscreen are genuinely compositor-owned, so they still
+    /// block. `tiled` must NOT, because in xdg-shell the `tiled_*` states mean only
+    /// that those edges are snapped against something, not that the compositor has
+    /// taken ownership of the size. Tiling compositors set them broadly, and COSMIC
+    /// (cosmic-comp) sets them on ordinary floating windows, so folding `tiled` in
+    /// here made `request_surface_size` a permanent no-op on that desktop: every
+    /// request was skipped, and the OLD size was still returned to the caller, so
+    /// nothing upstream could tell the resize had been dropped. Downstream that read
+    /// as "the compositor ignores resize requests" when the request never left the
+    /// client.
+    ///
+    /// Honouring the request while tiled costs nothing even where the compositor
+    /// really does own the size: it answers with a configure carrying the size it
+    /// wants, exactly as it does for any other client request it declines.
+    #[inline]
+    fn allows_client_resize(configure: &WindowConfigure) -> bool {
+        !(configure.is_maximized() || configure.is_fullscreen())
+    }
+
     /// Start interacting drag resize.
     pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), RequestError> {
         let xdg_toplevel = self.window.xdg_toplevel();
@@ -656,8 +684,23 @@ impl WindowState {
 
     /// Try to resize the window when the user can do so.
     pub fn request_surface_size(&mut self, surface_size: Size) -> PhysicalSize<u32> {
-        if self.last_configure.as_ref().map(Self::is_stateless).unwrap_or(true) {
-            self.resize(surface_size.to_logical(self.scale_factor()))
+        if self.last_configure.as_ref().map(Self::allows_client_resize).unwrap_or(true) {
+            let logical = surface_size.to_logical(self.scale_factor());
+            self.resize(logical);
+            // A size the CLIENT asked for IS its floating size, so record it as the one to
+            // restore to. `resize` will not have done it: its own update is gated on
+            // `is_stateless`, which is correct there because that path also serves
+            // compositor-driven configures, where a maximized or tiled size must never
+            // become the size the window returns to.
+            //
+            // Without this the two halves disagree the moment a tiling compositor is
+            // involved, and the disagreement is INVISIBLE until the window is untiled.
+            // `self.size` moves to the requested size while `stateless_size` keeps the one
+            // from before it; then the first configure that arrives stateless restores from
+            // `stateless_size` (see the `_ if stateless` arms in `configure`) and the window
+            // snaps back to a size it has not had for a while. Dragging the titlebar off a
+            // tile is exactly that configure.
+            self.stateless_size = logical;
         }
 
         logical_to_physical_rounded(self.surface_size(), self.scale_factor())
